@@ -7,7 +7,14 @@ authors = [
     { name = "Oguzb" }
 ]
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    "numpy>=2.5.4",
+    "obspy>=1.5.1",
+    "pandas>=3.1.1",
+    "scikit-learn>=1.9.1",
+    "scipy>=1.18.1",
+    "torch>=2.15.0",
+]
 
 [project.scripts]
 cnn-lstm-reg = "cnn_lstm_reg:main"
