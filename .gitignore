@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/
+
+# data, runs and logs stay out of the repository
+data/
+runs/
+logs/
+*.log
+*.pt
+*.ckpt
