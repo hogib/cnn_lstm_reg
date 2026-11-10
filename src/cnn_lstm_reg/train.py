@@ -1,6 +1,7 @@
-"""Trains the CNN-LSTM on one kind of input and scores it on the validation blocks.
+"""Trains one model (model.py) on one kind of input and scores it on the validation blocks.
 
-    uv run python -u -m cnn_lstm_reg.train --kind raw|features|pca --out runs/NAME [options]
+    uv run python -u -m cnn_lstm_reg.train --kind raw|features|pca [--arch lstm|transformer]
+                                           [--tokenizer cnn|patch] --out runs/NAME [options]
 
 Writes to --out: run.json (command line, settings, commit, versions, the days and their roles), train.log lines
 on stdout (one per LOG_EVERY steps: loss, learning rate, speed, ETA), metrics.jsonl (one line per epoch),
@@ -28,7 +29,7 @@ from torch import nn
 
 from . import data
 from .build_cache import commit
-from .model import CnnLstm
+from .model import DayModel
 
 LOG_EVERY = 10
 STATIONS = ["FRT", "KOVA", "MAYA", "NARI", "SVRC"]
@@ -91,8 +92,10 @@ def main():
                     help="least share of a day with data (raw) or with complete windows (features, pca)")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=16)
-    ap.add_argument("--lr", type=float, default=1e-3)
-    ap.add_argument("--weight-decay", type=float, default=1e-2)
+    ap.add_argument("--arch", choices=["lstm", "transformer"], default="lstm")
+    ap.add_argument("--tokenizer", choices=["cnn", "patch"], default="cnn", help="patch = no CNN, see model.py")
+    ap.add_argument("--lr", type=float, help="peak learning rate (default 1e-3 lstm, 5e-4 transformer)")
+    ap.add_argument("--weight-decay", type=float, help="default 0.01 lstm, 0.05 transformer")
     ap.add_argument("--hidden", type=int, default=64)
     ap.add_argument("--seed", type=int, default=0, help="of the model and the batches")
     ap.add_argument("--split-seed", type=int, default=0, help="of the blocks; keep it fixed across runs")
@@ -101,6 +104,10 @@ def main():
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
+    if args.lr is None:
+        args.lr = 1e-3 if args.arch == "lstm" else 5e-4
+    if args.weight_decay is None:
+        args.weight_decay = 1e-2 if args.arch == "lstm" else 5e-2
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     stations = args.stations.split(",")
@@ -129,7 +136,7 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "DONE").unlink(missing_ok=True)
     base, level_pred = baselines(args.kind, days, args.data)
-    model = CnnLstm(args.kind, channels, hidden=args.hidden).to(args.device)
+    model = DayModel(args.kind, channels, args.arch, args.tokenizer, hidden=args.hidden).to(args.device)
     n_params = sum(p.numel() for p in model.parameters())
     (args.out / "run.json").write_text(json.dumps(dict(
         argv=sys.argv, started=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
@@ -140,7 +147,7 @@ def main():
         days={r: int((days["role"] == r).sum()) for r in ("train", "val")},
         days_per_station=days.groupby(["station", "role"]).size().unstack(fill_value=0).to_dict("index"),
         split=[dict(station=r.station, date=r.date.isoformat(), role=r.role) for r in days.itertuples()]), indent=1))
-    print(f"{args.kind}: {len(idx['train'])} training and {len(idx['val'])} validation station-days, "
+    print(f"{args.kind}, {args.tokenizer} + {args.arch}, fold {args.fold}, seed {args.seed}: {len(idx['train'])} training and {len(idx['val'])} validation station-days, "
           f"{channels} input channels, {n_params:,} parameters, device {args.device}", flush=True)
     for name, s in base.items():
         print(f"baseline {name}: val MAE(log) {s['mae_log']:.3f} | median |error| {s['median_abs_days']:.0f} days | "
