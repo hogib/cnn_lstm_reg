@@ -7,6 +7,9 @@ the same blocks at every station, and each block is train, val or test as a whol
 to a day of another role is not used at all, so no sample has a neighbouring day in another set. The test
 blocks are held out: nothing in this package reads them until `roles(..., with_test=True)` is asked for.
 
+Pseudo-events (placebo): `event_day` moves the target to a date a whole number of blocks before the real
+event, where no earthquake happened, and `history` keeps only that many days before it (see event_roles).
+
 Inputs (`kind`):
   raw       the 5 Hz day signal of build_cache.py, (2, 432000): the scaled signal and a 0/1 data mask
   features  the 12 window features of import_features.py, (13, 432): robust-scaled, clipped, plus the mask
@@ -31,6 +34,11 @@ TEST_SHARE = 0.2     # of the blocks, held out
 FOLDS = 4            # the other blocks: one fold validates, three train (60 / 20 / 20 % of all blocks)
 RECENT_DAYS = 365    # the last year is dealt out on its own
 FIRST_DAY = dt.date(2015, 1, 24)   # five years before the event; fixed, so a block has the same role in every run
+EVENTS = {   # name: (mainshock, UTC; first day of the split; stations). Elazığ is the default everywhere.
+    "elazig_2020": (EVENT_TIME, FIRST_DAY, ["FRT", "KOVA", "MAYA", "NARI", "SVRC"]),
+    # time as in the sfc project of the stations; the day files start on 9 February 2025 (13 whole blocks from the 10th)
+    "balikesir_2025": (dt.datetime(2025, 8, 10, 16, 53, 0), dt.date(2025, 2, 10), ["PURS", "STEP", "DURS", "BKES"]),
+}
 
 
 def block_roles(seed, fold=0, first_day=FIRST_DAY, last_day=EVENT_TIME.date()):
@@ -41,16 +49,24 @@ def block_roles(seed, fold=0, first_day=FIRST_DAY, last_day=EVENT_TIME.date()):
     the seed; the others are dealt into FOLDS folds, and fold `fold` is the validation set. Over the FOLDS
     values of `fold` every block that is not a test block is validated once."""
     n_days = (last_day - first_day).days + 1
-    n_blocks = -(-n_days // BLOCK_DAYS)
+    fold_of_block = _deal(seed, -(-n_days // BLOCK_DAYS))
+    role_of_block = ["test" if f < 0 else "val" if f == fold else "train" for f in fold_of_block]
+    return _roles_by_day(role_of_block, n_days, last_day)
+
+
+def _deal(seed, n_blocks):
+    """Fold of every block (index = age of the block, 0 is the one that ends at the event), -1 for a test block."""
     rng = np.random.default_rng(seed)
-    role_of_block = np.empty(n_blocks, dtype=object)
+    fold_of_block = np.full(n_blocks, -1)
     recent = -(-RECENT_DAYS // BLOCK_DAYS)
     for stratum in (np.arange(min(recent, n_blocks)), np.arange(min(recent, n_blocks), n_blocks)):
         order = rng.permutation(stratum)
         n_test = round(TEST_SHARE * len(order))
-        role_of_block[order[:n_test]] = "test"
-        for i, block in enumerate(order[n_test:]):
-            role_of_block[block] = "val" if i % FOLDS == fold else "train"
+        fold_of_block[order[n_test:]] = np.arange(len(order) - n_test) % FOLDS
+    return fold_of_block
+
+
+def _roles_by_day(role_of_block, n_days, last_day):
     by_age = [role_of_block[age // BLOCK_DAYS] for age in range(n_days)]      # age = days before the event
     roles = {}
     for age in range(n_days):
@@ -60,8 +76,61 @@ def block_roles(seed, fold=0, first_day=FIRST_DAY, last_day=EVENT_TIME.date()):
     return roles
 
 
-def list_days(kind, data_dir, stations, min_coverage):
-    """Table of the usable station-days: station, date, days_to_event, coverage (and row in the feature file)."""
+def event_roles(event_day, history, seed, fold, first_day=FIRST_DAY, real_day=EVENT_TIME.date()):
+    """Roles of the `history` days up to `event_day`, which is the real event day or a pseudo-event a whole
+    number of blocks before it, so the blocks are the same calendar blocks as in block_roles.
+
+    The test blocks are the test blocks of block_roles(seed) and stay unread. The other blocks are dealt
+    into the folds in the order of their age (the first one that is not a test block to fold 0, the next
+    to fold 1, ...), so every event has the same geometry of training and validation blocks relative to
+    itself, and the blocks closest to it are in different folds."""
+    shift = (real_day - event_day).days
+    if shift < 0 or shift % BLOCK_DAYS or history % BLOCK_DAYS:
+        raise ValueError(f"the event day must lie a whole number of {BLOCK_DAYS}-day blocks before {real_day}, "
+                         f"and the history must be a whole number of blocks")
+    n_blocks = -(-((real_day - first_day).days + 1) // BLOCK_DAYS)
+    is_test = _deal(seed, n_blocks)[shift // BLOCK_DAYS:][:history // BLOCK_DAYS] < 0
+    if len(is_test) < history // BLOCK_DAYS:
+        raise ValueError("the history reaches back beyond the first day of the split")
+    role_of_block, i = [], 0
+    for t in is_test:
+        role_of_block.append("test" if t else "val" if i % FOLDS == fold else "train")
+        i += not t
+    return _roles_by_day(role_of_block, history, event_day)
+
+
+def held_out_days(seed, first_day=FIRST_DAY, real_day=EVENT_TIME.date()):
+    """The calendar days of the test blocks of block_roles(seed) and the days within GAP_DAYS of them."""
+    n_days = (real_day - first_day).days + 1
+    is_test = _deal(seed, -(-n_days // BLOCK_DAYS)) < 0
+    out = set()
+    for age in range(n_days):
+        if is_test[age // BLOCK_DAYS]:
+            out.update(real_day - dt.timedelta(days=age + g) for g in range(-GAP_DAYS, GAP_DAYS + 1))
+    return out
+
+
+def transfer_days(days, train_events, val_events, history, seed, first_day=FIRST_DAY, real_day=EVENT_TIME.date()):
+    """Split by period instead of by block: the `history` days up to each day of train_events are training
+    days and those up to each day of val_events are validation days, every day counted to its own event day
+    (column 'event'). Used to train on one winter and predict another. The days of the test blocks and the
+    days within GAP_DAYS of them are left out, so the held-out days stay unread and keep their gap."""
+    out, held = [], held_out_days(seed, first_day, real_day)
+    for role, events in (("train", train_events), ("val", val_events)):
+        for ev in events:
+            to_event = np.array([(ev - d).days for d in days["date"]])
+            keep = (to_event >= 0) & (to_event < history) & ~days["date"].isin(held).to_numpy()
+            out.append(days[keep].assign(days_to_event=to_event[keep], role=role, event=ev.isoformat()))
+    out = pd.concat(out, ignore_index=True)
+    if out.duplicated(["station", "date"]).any():
+        raise ValueError("the periods of the events overlap")
+    return out
+
+
+def list_days(kind, data_dir, stations, min_coverage, event_day=None, history=None):
+    """Table of the usable station-days: station, date, days_to_event, coverage (and row in the feature file).
+    With event_day the days are counted to that day instead of the real event, and only the `history` days
+    up to it are kept."""
     frames = []
     for s in stations:
         f = Path(data_dir) / ("raw5hz" if kind == "raw" else "features") / (f"{s}/index.csv" if kind == "raw" else f"{s}_index.csv")
@@ -71,12 +140,18 @@ def list_days(kind, data_dir, stations, min_coverage):
         frames.append(df[["station", "date", "days_to_event", "coverage", "row"]])
     days = pd.concat(frames, ignore_index=True)
     days["date"] = days["date"].dt.date
+    if event_day is not None:
+        days["days_to_event"] = [(event_day - d).days for d in days["date"]]
+        days = days[days["days_to_event"] < history]
     return days[(days["coverage"] >= min_coverage) & (days["days_to_event"] >= 0)].reset_index(drop=True)
 
 
-def split(days, seed, fold=0, with_test=False):
-    """Adds the 'role' column; days in a gap are dropped, and so are the test days unless with_test."""
-    roles = block_roles(seed, fold)
+def split(days, seed, fold=0, with_test=False, event_day=None, history=None, first_day=FIRST_DAY,
+          real_day=EVENT_TIME.date()):
+    """Adds the 'role' column; days in a gap are dropped, and so are the test days unless with_test.
+    With event_day the roles are those of event_roles."""
+    roles = (block_roles(seed, fold, first_day, real_day) if event_day is None
+             else event_roles(event_day, history, seed, fold, first_day, real_day))
     days = days.assign(role=days["date"].map(roles)).dropna(subset=["role"])
     return (days if with_test else days[days["role"] != "test"]).reset_index(drop=True)
 

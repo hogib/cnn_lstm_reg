@@ -1,6 +1,6 @@
 """Raw-signal cache: one band-passed, downsampled array per station and day.
 
-    uv run python -m cnn_lstm_reg.build_cache DAYS_DIR OUT_DIR --station FRT [--jobs 4]
+    uv run python -m cnn_lstm_reg.build_cache DAYS_DIR OUT_DIR --station FRT [--jobs 4] [--event-time ISO]
 
 DAYS_DIR holds one MiniSEED file per day of one component (the files `sfc split-days` writes, named
 <NET>_<STATION>_<DDMMYYYY>_000000_<DDMMYYYY>_000000_<CHANNEL>.mseed). For each day up to the event day:
@@ -13,7 +13,7 @@ DAYS_DIR holds one MiniSEED file per day of one component (the files `sfc split-
 
 Days already in the cache are kept (their index rows are reused) unless --overwrite is given. The event day
 is cut at the start of the hour of the mainshock, as in sfc, so the mainshock is never in the cache; later days
-are left out.
+are left out. --event-time gives the mainshock of another event than Elazığ (UTC, e.g. 2025-08-10T16:53:00).
 
 The filtering follows preprocess.py of seismic-features-classification (commit d274fda): gaps shorter than
 GAP_THRESHOLD seconds are interpolated, every longer gap splits the day into segments that are demeaned,
@@ -110,14 +110,14 @@ def process(x, fs):
 
 
 def one_day(job):
-    path, date, out_file = job
+    path, date, out_file, event_time = job
     raw = Path(path).read_bytes()
-    x, fs = day_signal(raw, date)
+    x, fs = day_signal(raw, date, event_time)
     out, gaps = process(x, fs)
     tmp = out_file.with_suffix(".tmp.npy")
     np.save(tmp, out)
     os.replace(tmp, out_file)
-    return dict(date=date.isoformat(), days_to_event=(EVENT_TIME.date() - date).days,
+    return dict(date=date.isoformat(), days_to_event=(event_time.date() - date).days,
                 coverage=round(float(np.isfinite(out).mean()), 5), input_rate=fs, gaps=gaps,
                 file=Path(path).name, sha256=hashlib.sha256(raw).hexdigest())
 
@@ -139,6 +139,8 @@ def main():
     ap.add_argument("--station", required=True)
     ap.add_argument("--jobs", type=int, default=4)
     ap.add_argument("--overwrite", action="store_true")
+    ap.add_argument("--event-time", type=dt.datetime.fromisoformat, default=EVENT_TIME,
+                    help="UTC time of the mainshock (default: Elazığ 2020)")
     args = ap.parse_args()
 
     out = args.out_dir / args.station
@@ -148,7 +150,7 @@ def main():
     files = {}
     for f in sorted(args.days_dir.glob("*.mseed")):
         d = file_date(f.name)
-        if d is not None and d <= EVENT_TIME.date():
+        if d is not None and d <= args.event_time.date():
             files[d] = f
     jobs, rows = [], []
     for d, f in sorted(files.items()):
@@ -156,7 +158,7 @@ def main():
         if d.isoformat() in old and target.exists():
             rows.append(dict(date=d.isoformat(), **old[d.isoformat()]))
         else:
-            jobs.append((str(f), d, target))
+            jobs.append((str(f), d, target, args.event_time))
     print(f"{args.station}: {len(files)} day files up to the event, {len(rows)} already cached, {len(jobs)} to do",
           flush=True)
 
@@ -181,7 +183,7 @@ def main():
     import obspy
     (out / "provenance.json").write_text(json.dumps(dict(
         argv=sys.argv, written=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        parameters=dict(event_time=EVENT_TIME.isoformat(), rate=RATE, freqmin=FREQMIN, freqmax=FREQMAX,
+        parameters=dict(event_time=args.event_time.isoformat(), rate=RATE, freqmin=FREQMIN, freqmax=FREQMAX,
                         filter_order=FILTER_ORDER, gap_threshold=GAP_THRESHOLD, min_segment=MIN_SEGMENT),
         commit=commit(), versions=dict(python=platform.python_version(), numpy=np.__version__,
                                        scipy=scipy.__version__, obspy=obspy.__version__, pandas=pd.__version__),

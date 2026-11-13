@@ -3,6 +3,12 @@
     uv run python -u -m cnn_lstm_reg.train --kind raw|features|pca [--arch lstm|transformer]
                                            [--tokenizer cnn|patch] --out runs/NAME [options]
 
+With --event-day and --history the target is the time to that day instead (a pseudo-event when it is not the
+day of the earthquake) and only the days of the history before it are used; see data.event_roles.
+With --train-events, --val-events and --history the split is by period (data.transfer_days): the model is
+trained on the days before some days and predicts the days before others, each counted to its own day; the
+last epoch is scored then, since choosing the epoch on the validation period would use the period under test.
+
 Writes to --out: run.json (command line, settings, commit, versions, the days and their roles), train.log lines
 on stdout (one per LOG_EVERY steps: loss, learning rate, speed, ETA), metrics.jsonl (one line per epoch),
 best.pt and val_predictions.csv of the best epoch, and an empty file DONE at the end.
@@ -32,7 +38,6 @@ from .build_cache import commit
 from .model import DayModel
 
 LOG_EVERY = 10
-STATIONS = ["FRT", "KOVA", "MAYA", "NARI", "SVRC"]
 
 
 def scores(y, p):
@@ -68,6 +73,12 @@ def baselines(kind, days, data_dir):
     return dict(train_mean=scores(y[va], np.full(va.sum(), y[tr].mean())), level_only=scores(y[va], level_pred)), level_pred
 
 
+def plain(args):
+    """The arguments as JSON can hold them."""
+    return {k: str(v) if isinstance(v, (Path, dt.date)) else [x.isoformat() for x in v] if isinstance(v, list) else v
+            for k, v in vars(args).items()}
+
+
 @torch.no_grad()
 def predict(model, loader, device):
     model.eval()
@@ -83,7 +94,9 @@ def main():
     ap.add_argument("--kind", required=True, choices=["raw", "features", "pca"])
     ap.add_argument("--out", required=True, type=Path)
     ap.add_argument("--data", type=Path, default=Path("data"))
-    ap.add_argument("--stations", default=",".join(STATIONS))
+    ap.add_argument("--event", choices=sorted(data.EVENTS), default="elazig_2020",
+                    help="the earthquake: its day, the calendar of the blocks and the default stations")
+    ap.add_argument("--stations", help="a,b,... (default: the stations of the event)")
     ap.add_argument("--norm", choices=["station", "day"], default="station", help="raw input only, see data.RawDays")
     ap.add_argument("--pca", type=float, default=7, help="pca input: number of components (or a share of variance)")
     ap.add_argument("--same-days-as-features", action="store_true",
@@ -100,6 +113,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0, help="of the model and the batches")
     ap.add_argument("--split-seed", type=int, default=0, help="of the blocks; keep it fixed across runs")
     ap.add_argument("--fold", type=int, default=0, choices=range(data.FOLDS), help="which fold validates")
+    ap.add_argument("--event-day", type=dt.date.fromisoformat,
+                    help="count the days to this day (YYYY-MM-DD, a whole number of blocks before the event)")
+    ap.add_argument("--history", type=int, help="with --event-day or --train-events: use only this many days up to it")
+    dates = lambda t: [dt.date.fromisoformat(x) for x in t.split(",")]  # noqa: E731
+    ap.add_argument("--train-events", type=dates, help="split by period: train on the history of these days (a,b,...)")
+    ap.add_argument("--val-events", type=dates, help="split by period: predict the history of these days")
+    ap.add_argument("--pick", choices=["best", "last"], help="epoch that is scored: lowest validation error "
+                    "(default) or the last one (default with --train-events)")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
@@ -110,12 +131,25 @@ def main():
         args.weight_decay = 1e-2 if args.arch == "lstm" else 5e-2
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    stations = args.stations.split(",")
-    days = data.list_days(args.kind, args.data, stations, args.min_coverage)
+    event_time, first_day, event_stations = data.EVENTS[args.event]
+    grid = dict(first_day=first_day, real_day=event_time.date())
+    stations = args.stations.split(",") if args.stations else event_stations
+    transfer = args.train_events is not None
+    if transfer != (args.val_events is not None) or (transfer and args.event_day is not None):
+        ap.error("--train-events and --val-events go together, without --event-day")
+    if (args.event_day is None and not transfer) != (args.history is None):
+        ap.error("--history goes with --event-day or with --train-events")
+    if args.pick is None:
+        args.pick = "last" if transfer else "best"
+    days = data.list_days(args.kind, args.data, stations, args.min_coverage, args.event_day,
+                          None if transfer else args.history)
     if args.kind == "raw" and args.same_days_as_features:
         keep = data.list_days("features", args.data, stations, 0.0)[["station", "date"]]
         days = days.merge(keep, on=["station", "date"])
-    days = data.split(days, args.split_seed, args.fold)
+    if transfer:
+        days = data.transfer_days(days, args.train_events, args.val_events, args.history, args.split_seed, **grid)
+    else:
+        days = data.split(days, args.split_seed, args.fold, event_day=args.event_day, history=args.history, **grid)
     if (days["role"] == "train").sum() == 0 or (days["role"] == "val").sum() == 0:
         sys.exit("no training or no validation days")
 
@@ -140,7 +174,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     (args.out / "run.json").write_text(json.dumps(dict(
         argv=sys.argv, started=dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-        settings={k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
+        settings=plain(args),
         commit=commit(), versions=dict(python=platform.python_version(), torch=torch.__version__, numpy=np.__version__),
         device=torch.cuda.get_device_name(0) if args.device.startswith("cuda") else args.device,
         parameters=n_params, baselines=base,
@@ -182,18 +216,21 @@ def main():
             fh.write(json.dumps(dict(epoch=epoch, step=step, train_loss=float(np.mean(running)), **s)) + "\n")
         print(f"epoch {epoch} | train loss {np.mean(running):.4f} | val MAE(log) {s['mae_log']:.3f} | "
               f"median |error| {s['median_abs_days']:.0f} days | Spearman {s['spearman']:.2f}"
-              f"{' | best' if s['mae_log'] < best else ''}", flush=True)
-        if s["mae_log"] < best:
+              f"{' | best' if args.pick == 'best' and s['mae_log'] < best else ''}", flush=True)
+        if s["mae_log"] < best if args.pick == "best" else epoch == args.epochs:
             best = s["mae_log"]
-            torch.save(dict(model=model.state_dict(), epoch=epoch, scores=s, settings=vars(args)), args.out / "best.tmp")
+            torch.save(dict(model=model.state_dict(), epoch=epoch, scores=s,
+                            settings=plain(args)),
+                       args.out / "best.tmp")
             os.replace(args.out / "best.tmp", args.out / "best.pt")
             val_days = days.iloc[idx["val"]]
             val_days.assign(predicted_log=p, predicted_days=np.expm1(p), level_only_log=level_pred,
                             train_mean_log=float(data.target(days.loc[days["role"] == "train", "days_to_event"]).mean()))[
                 ["station", "date", "days_to_event", "predicted_log", "predicted_days", "level_only_log", "train_mean_log"]
+                + (["event"] if transfer else [])
             ].to_csv(args.out / "val_predictions.csv", index=False)
     (args.out / "DONE").touch()
-    print(f"DONE | best val MAE(log) {best:.3f} | baselines: train mean {base['train_mean']['mae_log']:.3f}, "
+    print(f"DONE | {args.pick} val MAE(log) {best:.3f} | baselines: train mean {base['train_mean']['mae_log']:.3f}, "
           f"level only {base['level_only']['mae_log']:.3f}", flush=True)
 
 

@@ -31,6 +31,10 @@ uv run python -u -m cnn_lstm_reg.train --kind raw --out runs/raw_station
 
 # 4. all four inputs on all four folds, then the out-of-fold summary (runs/folds_summary.txt)
 scripts/train_folds.sh
+
+# 5. pseudo-event placebo: the raw input trained towards the event day and towards 13 days without an
+#    earthquake, each with the 182 days before it (runs/placebo/placebo_summary.txt, placebo_events.csv)
+scripts/train_placebo.sh
 ```
 
 `data/`, `runs/` and `logs/` are not in the repository.
