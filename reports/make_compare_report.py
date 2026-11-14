@@ -97,6 +97,25 @@ def table(rows, widths, head_rows=1, zebra=True):
     return t
 
 
+def note(title, lines, W):
+    """Shaded box of short lines: a cheat note for presenting, not part of the description of the runs."""
+    box = Table([[[P(f"<b>Cheat note: {title}</b>", "body")] + [P("• " + x, "body") for x in lines]]], colWidths=[W])
+    box.setStyle(TableStyle([("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#fff6d6")),
+                             ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#d9b84a")),
+                             ("TOPPADDING", (0, 0), (-1, -1), 4), ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                             ("LEFTPADDING", (0, 0), (-1, -1), 7), ("RIGHTPADDING", (0, 0), (-1, -1), 7)]))
+    return [Spacer(1, 7), box]
+
+
+SCALING_NOTE = [
+    "Station scale: every day is divided by one number per station (the median standard deviation of its training "
+    "days). A loud day stays loud, so the model sees how the day compares with the station's usual level.",
+    "Day scale: every day is divided by its own standard deviation. The loudness of the day as a whole is removed; "
+    "what is left is its shape (the course within the day, how spiky it is, its frequency content).",
+    "A result that holds with day scale comes from the shape; one that holds only with station scale comes mainly "
+    "from the loudness of the day. Day scale does not remove everything that goes along with a loud day."]
+
+
 def fig_to_image(fig, width_cm):
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=200, bbox_inches="tight", facecolor="white")
@@ -600,7 +619,7 @@ def fig_placebo(t, real_day=EVENT_TIME.date()):
 
 
 def placebo_story(pl, W, real_day=EVENT_TIME.date(), heading="9. Pseudo-event placebo", what=None, split=None,
-                  cut_hour=EVENT_TIME.hour):
+                  cut_hour=EVENT_TIME.hour, reading=None, scaling=True):
     """Section of a pseudo-event placebo; `what` and `split` replace the two paragraphs written for Elazığ."""
     t, info = pl
     s0 = info[0]["settings"]
@@ -648,6 +667,7 @@ def placebo_story(pl, W, real_day=EVENT_TIME.date(), heading="9. Pseudo-event pl
                      placebo_cell(g, "auc_month_level", True)])
     story += [KeepTogether([P("<b>The real event among the pseudo-events</b>", "cell"), Spacer(1, 3),
                             table(rows, [W * .14, W * .1] + [W * .19] * 4, zebra=False)]),
+              *placebo_notes(t, events, W, reading, scaling)[0],
               PageBreak(), fig_to_image(fig_placebo(t, real_day), W / cm * .97), Spacer(1, 8)]
 
     g0 = t[(t["input"] == configs[0][0]) & (t["arch"] == configs[0][1])].set_index("event")
@@ -681,7 +701,35 @@ def placebo_story(pl, W, real_day=EVENT_TIME.date(), heading="9. Pseudo-event pl
                   "day of a pseudo-event is a whole day. The epoch that is scored is chosen on the validation days, "
                   "for every event in the same way. Commit recorded by the placebo runs: " + "; ".join(commits) + ".",
                   S["small"])]
+    story += placebo_notes(t, events, W, reading, scaling)[1]
     return story
+
+
+def placebo_notes(t, events, W, reading, scaling):
+    real, pseudo = t[t["real"]], t[~t["real"]]
+    g0 = t[(t["input"] == t["input"].iloc[0]) & (t["arch"] == t["arch"].iloc[0])]
+    lv_real, lv_pseudo = g0[g0["real"]]["auc_month_level"].iloc[0], g0[~g0["real"]]["auc_month_level"].median()
+    near = [f"{span_text(t[t['event'] == e]['rho_folds'])} for {e}" for e in events[1:3]]
+    out = note("how to read the table above", [
+        f"A cell is: real · pseudo median (range) · rank. Real is the score with the countdown aimed at the "
+        f"earthquake, pseudo the same score for the {len(events) - 1} dates without one. Rank 1 is the best; 1 of "
+        f"{len(events)} is the most a rank can say.",
+        "MAE: lower is better. Gain above 0: better than loudness alone. Spearman of the folds: are the days put in "
+        "the right order (1 perfect, 0 none); the score to trust most. Final-month AUC: 0.5 is chance.",
+        "The level only rows are loudness alone: a straight line on the level of the day."], W)
+    after = note("what the tables of this section show", [
+        f"Spearman of the folds for the earthquake: {span_text(real['rho_folds'])} over the four setups; the highest of "
+        f"any pseudo-event: {minus(f'{pseudo.rho_folds.max():.2f}')}. For the two dates closest to the earthquake: "
+        + "; ".join(near) + ".",
+        f"Loudness alone, final-month AUC: {minus(f'{lv_real:.2f}')} for the earthquake, median "
+        f"{minus(f'{lv_pseudo:.2f}')} for the pseudo-events.",
+        "Table of every event: one line per target date, cells are MAE · final-month AUC. Compare a "
+        "cell with the level only cell of its line, not with other lines: the lines differ in their validation "
+        f"days. A low MAE on a line with few days in the last {plc.MONTH} is a narrow range of targets, not a "
+        "good prediction."] + ([reading] if reading else []), W)
+    if scaling:
+        after += note("station scale and day scale", SCALING_NOTE, W)
+    return out, after
 
 
 WINTER_ORDER = ["2015-16", "2018-19", "2019-20"]
@@ -755,6 +803,16 @@ def winters_story(wn, W):
         "day close to 24 January, so its rows are scored on earlier days only; the recordings of the three winters "
         "may also differ for reasons that have nothing to do with season or earthquake (instrument, site).",
         S["small"]))
+    thin = days.loc[WINTER_ORDER[1]]
+    story += note("how to read the three tables", [
+        "A line is one pair: trained on the winter(s) of column 1, predicting the winter of column 2. The first "
+        "six lines train on one winter, the last three on two. Cells are mean ± standard deviation over the seeds.",
+        "Spearman is the main table; the final-month AUC and the MAE tell the same story. Compare a cell with the "
+        "level only cell of its line.",
+        f"Lines predicting {WINTER_ORDER[1]}: no day closer than {int(thin['nearest'])} days to 24 January and "
+        f"{int(thin['month_days'])} days in the last {plc.MONTH}. Their low MAE is a narrow range of targets, and "
+        "their AUC is rough.",
+        "Station scale and day scale: see the note in section 9."], W)
     if not di.empty:
         ev = sorted(di["event"].unique(), reverse=True)
         d0 = di.drop_duplicates("event").set_index("event")
@@ -783,10 +841,20 @@ def winters_story(wn, W):
                       f"seeds.", S["body"]),
                   Spacer(1, 5),
                   table(rows, [W * .15, W * .08, W * .08, W * .11] + [W * .58 / len(configs)] * len(configs))]
+        quake = EVENT_TIME.date().isoformat()
+        best = [f"{names[k]} · {dict(ARCHS)[a]}" for k, a in configs
+                if di[(di["input"] == k) & (di["arch"] == a)].set_index("event")["rho_folds"].idxmax() == quake]
+        story += note("how to read this table", [
+            "A line is one target date; a model cell is MAE · Spearman of the folds · final-month AUC.",
+            f"The earthquake has the highest Spearman of the three dates in {len(best)} of {len(configs)} setups"
+            + (f" ({', '.join(best)})" if best else "") + ".",
+            f"Too little data to conclude from: about 20 to 60 training days per fold, and "
+            f"{' and '.join(str(int(d0.loc[e, 'month_days'])) for e in ev[1:])} days in the last {plc.MONTH} for the "
+            f"two other dates."], W)
     return story
 
 
-def span(v):
+def span_text(v):
     """'0.60' or '0.68 to 0.73' for the values v"""
     a, b = f"{np.min(v):.2f}", f"{np.max(v):.2f}"
     return minus(a if a == b else f"{a} to {b}")
@@ -808,17 +876,17 @@ def winters_note(tr, names):
     quiet = pd.concat([qq, eq])
     day = single[single["input"].str.endswith("day")]
     lines = [
-        f"From one winter without an earthquake to the other: Spearman {span(qq.rho)} (level only {span(qq.rho_level)}). A "
+        f"From one winter without an earthquake to the other: Spearman {span_text(qq.rho)} (level only {span_text(qq.rho_level)}). A "
         f"countdown to 24 January is learned where no earthquake followed.",
-        f"From the earthquake winter to the winters without: {span(eq.rho)}. What is learned from the earthquake winter works "
+        f"From the earthquake winter to the winters without: {span_text(eq.rho)}. What is learned from the earthquake winter works "
         f"equally where no earthquake follows.",
-        f"From the winters without to the earthquake winter: {span(qe.rho)}, but level only already gives {span(qe.rho_level)}. "
-        f"The model adds {span(qe.rho - qe.rho_level)} to level only here, {span(quiet.rho - quiet.rho_level)} in "
+        f"From the winters without to the earthquake winter: {span_text(qe.rho)}, but level only already gives {span_text(qe.rho_level)}. "
+        f"The model adds {span_text(qe.rho - qe.rho_level)} to level only here, {span_text(quiet.rho - quiet.rho_level)} in "
         f"the winters without an earthquake.",
         f"Order, not timing: for the last {plc.MONTH} days before the earthquake the median prediction is "
         f"{qe.month_pred.min():.0f} to {qe.month_pred.max():.0f} days."]
     if len(day):
-        lines.append(f"Day scale (the day's level removed), both models: {span(day.rho)}. What transfers between "
+        lines.append(f"Day scale (the day's level removed), both models: {span_text(day.rho)}. What transfers between "
                      f"winters is mainly the level of the day.")
     lines.append("Reading: the countdown at SVRC does not need an earthquake; season alone can produce it. Not ruled "
                  "out: a precursor underneath the seasonal trend. One station, three winters, "
@@ -835,14 +903,14 @@ def winters_bullet(wn):
     parts = []
     for (k, a), g in tr[~day].groupby(["input", "arch"], sort=False):
         qq, eq, qe = winter_groups(g)
-        parts.append(f"{dict(ARCHS)[a]} {span(qq.rho)} between the two winters without an earthquake, "
-                     f"{span(eq.rho)} from the earthquake winter to those, {span(qe.rho)} from those to the "
+        parts.append(f"{dict(ARCHS)[a]} {span_text(qq.rho)} between the two winters without an earthquake, "
+                     f"{span_text(eq.rho)} from the earthquake winter to those, {span_text(qe.rho)} from those to the "
                      f"earthquake winter")
     text = ("<b>SVRC winters (section 10).</b> With station scaling a countdown to 24 January transfers between "
             "winters whether or not they end with the earthquake. Spearman of models trained on one winter and "
             "predicting another: " + "; ".join(parts) + ".")
     if day.any():
-        text += f" With day scaling: {span(pd.concat(winter_groups(tr[day])).rho)} over all pairs and both models."
+        text += f" With day scaling: {span_text(pd.concat(winter_groups(tr[day])).rho)} over all pairs and both models."
     return text
 
 
@@ -1171,7 +1239,10 @@ def build(runs, data, out):
                   "those of commit 25620fb. The epoch that is scored is chosen on the validation days themselves, "
                   "which favours every model a little and both models in the same way.", S["small"])]
     if pl is not None:
-        story += placebo_story(pl, W)
+        story += placebo_story(pl, W, reading=(
+            "Reading: with station scale the earthquake scores best, but the dates two and four weeks before it "
+            "score almost as well, and loudness alone already separates its final month. The models follow "
+            "something that changes slowly through December and January, not the day of the earthquake."))
     if wn is not None:
         story += winters_story(wn, W)
     if bk is not None:
@@ -1193,7 +1264,13 @@ def build(runs, data, out):
             split=(f"<b>Split.</b> {BLOCK_DAYS}-day blocks counted back from the mainshock; "
                    f"{100 * TEST_SHARE:.0f} % of the 13 blocks are test blocks and were not read. For every event "
                    f"the other blocks are dealt into the folds in the order of their age, as in section 9."),
-            cut_hour=bk_time.hour)
+            cut_hour=bk_time.hour, scaling=False,
+            reading=("Reading: no countdown to this earthquake. Where it ranks first on Spearman the value lies "
+                     "inside what the pseudo-events reach, and on MAE it is among the worst events."
+                     + (f" At Elazığ the Spearman of the earthquake was {span_text(pl[0][pl[0]['real']]['rho_folds'])}."
+                        if pl is not None else "")
+                     + f" Low power: {min(tr_days)} to {max(tr_days)} training station-days per run. Station scale "
+                       "and day scale: see the note in section 9."))
 
     def footer(canvas, doc_):
         canvas.saveState()
